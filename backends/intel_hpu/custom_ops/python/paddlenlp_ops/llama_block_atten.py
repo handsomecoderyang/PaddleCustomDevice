@@ -31,11 +31,10 @@ def prepare_input_hpu(
     rope_emb,
     block_tables,
     block_size,
-    seq_lens_this_time,
     seq_lens_encoder,
     seq_lens_decoder,
+    device_dtype,
 ):
-    max_seq_lens_this_time = paddle.max(seq_lens_this_time, axis=0).item()
     max_enc_len = paddle.max(seq_lens_encoder, axis=0).item()
     max_dec_len = paddle.max(seq_lens_decoder, axis=0).item()
 
@@ -48,6 +47,7 @@ def prepare_input_hpu(
         valid_batch = batch_ids.shape[0]
 
         input_tokens = paddle.index_select(input_ids, batch_ids)
+        seq_lens = paddle.index_select(seq_lens_encoder, batch_ids).flatten()
         block_tables_seg = paddle.index_select(block_tables, batch_ids)
 
         total_batch = round_up(valid_batch, batch_step)
@@ -55,58 +55,58 @@ def prepare_input_hpu(
         max_buckets = (max_enc_len + block_size - 1) // block_size
         max_prompt_len = max_buckets * block_size
 
-        src_padded = paddle.full(
-            (total_batch, max_prompt_len), 0, dtype=input_ids.dtype
-        ).to("CPU")
-        blk_padded = paddle.full(
-            (total_batch, max_buckets), -1, dtype=block_tables.dtype
-        ).to("CPU")
+        src_padded = paddle.tensor.fill_constant(
+            (total_batch, max_prompt_len), input_ids.dtype, 0, force_cpu=True
+        )
+        blk_padded = paddle.tensor.fill_constant(
+            (total_batch, max_buckets), block_tables.dtype, -1, force_cpu=True
+        )
 
         src_padded[:valid_batch, :max_prompt_len] = input_tokens[:, :max_prompt_len]
         blk_padded[:valid_batch, :max_buckets] = block_tables_seg[:, :max_buckets]
-        block_indices_padded = blk_padded.flatten().to("intel_hpu")
+        block_indices = blk_padded.flatten().to("intel_hpu")
 
         # rope_emb: [2, B=1, T=4096, 1, 128] --> [2, B=1, T=max_prompt_len, 1, 128]
         # Prefill:  [2, 1, T, 1, 128]
         rope_emb_seg = rope_emb[..., :max_prompt_len, :, :]
+        rope_emb_seg = rope_emb_seg.to(device_dtype)
 
-        block_offset_padded = None
+        block_offset = None
         block_groups = None
         block_list = None
         block_mapping = None
         attn_bias = None
-        seq_lens_padded = None
     # decoding
     elif max_dec_len > 0:
         batch_ids = paddle.where(seq_lens_decoder > 0)[0].flatten()
         valid_batch = batch_ids.shape[0]
 
-        input_tokens = paddle.index_select(input_ids, batch_ids)[:, 0].to("CPU")
-        seq_lens = paddle.index_select(seq_lens_decoder, batch_ids).flatten().to("CPU")
-        block_tables_seg = paddle.index_select(block_tables, batch_ids).to("CPU")
+        input_tokens = paddle.index_select(input_ids, batch_ids)[:, 0]
+        seq_lens = paddle.index_select(seq_lens_decoder, batch_ids).flatten()
+        block_tables_seg = paddle.index_select(block_tables, batch_ids)
 
         total_batch = round_up(valid_batch, batch_step)
 
-        src_padded = paddle.full((total_batch), 0, dtype=input_ids.dtype).to("CPU")
-        seq_lens_padded = paddle.full(
-            (total_batch), 0, dtype=seq_lens_decoder.dtype
-        ).to("CPU")
-        block_indices_padded = paddle.full(
-            (total_batch), -1, dtype=block_tables.dtype
-        ).to("CPU")
-        block_offset_padded = paddle.full(
-            (total_batch), 0, dtype=block_tables.dtype
-        ).to("CPU")
+        src_padded = paddle.tensor.fill_constant(
+            (total_batch), input_ids.dtype, 0, force_cpu=True
+        )
+        seq_lens_padded = paddle.tensor.fill_constant(
+            (total_batch), seq_lens_decoder.dtype, 0, force_cpu=True
+        )
+        block_indices_padded = paddle.tensor.fill_constant(
+            (total_batch), block_tables.dtype, -1, force_cpu=True
+        )
+        block_offset_padded = paddle.tensor.fill_constant(
+            (total_batch), block_tables.dtype, 0, force_cpu=True
+        )
 
         src_padded[:valid_batch] = input_tokens[:]
         seq_lens_padded[:valid_batch] = seq_lens[:]
 
         last_block_pos = (seq_lens - 1) // block_size
-        block_indices = (
-            paddle.index_sample(block_tables_seg, last_block_pos.unsqueeze(1))
-            .squeeze(1)
-            .to("CPU")
-        )
+        block_indices = paddle.index_sample(
+            block_tables_seg, last_block_pos.unsqueeze(1)
+        ).squeeze(1)
         block_offset = (seq_lens - 1) % block_size
 
         block_indices_padded[:valid_batch] = block_indices[:]
@@ -119,6 +119,7 @@ def prepare_input_hpu(
             .squeeze(1)
             .unsqueeze(2)
         )
+        rope_emb_seg = rope_emb_seg.to(device_dtype)
 
         block_list = []
         block_groups = []
@@ -142,17 +143,16 @@ def prepare_input_hpu(
 
         block_list = padding_fn(block_list, -1)
         block_groups = padding_fn(block_groups, -1)
+        block_groups_host = paddle.to_tensor(block_groups, dtype="float32", place="cpu")
 
-        block_list = paddle.to_tensor(block_list)
-        block_groups = paddle.to_tensor(block_groups)
-
-        block_groups_host = block_groups.to("cpu").to("float32")
         block_mapping = paddle.nn.functional.relu(block_groups_host)
         block_mapping = block_mapping.to("int32")
         block_mapping = paddle.nn.functional.one_hot(
             block_mapping, num_classes=total_batch
         )
-        oob_values = block_groups_host.less_than(paddle.to_tensor(0))
+        oob_values = block_groups_host.less_than(
+            paddle.to_tensor(0, dtype="float32", place="cpu")
+        )
         block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
 
         block_usage = []
@@ -165,11 +165,17 @@ def prepare_input_hpu(
                     block_usage.append(length.item())
                     length = 0
         block_usage = padding_fn(block_usage, 1)
-        block_usage = paddle.to_tensor(block_usage, dtype="int32", place="cpu")
+        block_usage = paddle.to_tensor(block_usage, dtype="int32")
 
-        mask = paddle.arange(0, block_size, dtype="int32").cpu()
+        mask = paddle.arange(0, block_size, dtype="int32")
         mask = mask >= block_usage.unsqueeze(-1)
-        attn_bias = paddle.zeros_like(mask, dtype="float32").masked_fill_(
+
+        block_groups = paddle.to_tensor(block_groups)
+        block_list = paddle.to_tensor(block_list)
+        block_mapping = block_mapping.to(device_dtype)
+        block_indices = block_indices_padded.to("intel_hpu")
+        block_offset = block_offset_padded.to("intel_hpu")
+        attn_bias = paddle.zeros_like(mask, dtype=device_dtype).masked_fill_(
             mask, float("-inf")
         )
 
@@ -178,47 +184,11 @@ def prepare_input_hpu(
         rope_emb_seg,
         block_groups,
         block_list,
-        block_indices_padded,
-        block_offset_padded,
+        block_indices,
+        block_offset,
         block_mapping,
         attn_bias,
-        batch_ids,
-        seq_lens_padded,
-    )
-
-
-def get_padding_offset_v2(
-    input_ids, cum_offset, token_num, seq_lens, draft_tokens=None, seq_lens_encoder=None
-):
-    bsz, max_seq_len = input_ids.shape
-    cum_offsets_now = paddle.cumsum(max_seq_len - seq_lens)
-    cum_offsets = paddle.zeros(shape=(bsz + 1), dtype="int32")
-    cum_offsets[1:] = cum_offsets_now
-    token_num = paddle.sum(seq_lens)
-    x_remove_padding = paddle.zeros(shape=(token_num), dtype=input_ids.dtype)
-    padding_offsets = paddle.zeros(shape=(token_num), dtype="int32")
-    cu_seqlens_q = paddle.zeros(shape=(bsz + 1), dtype="int32")
-    cu_seqlens_k = paddle.zeros(shape=(bsz + 1), dtype="int32")
-    current_index = 0
-    for i in range(bsz):
-        seq_len_now = seq_lens[i].item()
-        cum_offset = cum_offsets[i].item()
-        # x_remove_padding = paddle.concat((x_remove_padding, input_ids[i, :seq_len_now]))
-        x_remove_padding[current_index : current_index + seq_len_now] = input_ids[
-            i, :seq_len_now
-        ]
-        current_index += seq_len_now
-        for j in range(seq_len_now):
-            padding_offsets[i * max_seq_len - cum_offset + j] = cum_offset
-        cum_seq_len = (i + 1) * max_seq_len - cum_offsets[i + 1].item()
-        cu_seqlens_q[i + 1] = cum_seq_len
-        cu_seqlens_k[i + 1] = cum_seq_len
-    return (
-        x_remove_padding,
-        cum_offsets[:-1],
-        padding_offsets,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        seq_lens,
     )
 
 
@@ -226,31 +196,31 @@ def rebuild_padding_v2(
     tmp_out,
     cum_offsets,
     seq_lens_decoder,
-    seq_len_encoder,
+    seq_lens_encoder,
     output_padding_offset=None,
     max_len=-1,
 ):
-    # tmp_out, // [token_num, dim_embed]
-    # cum_offsets, // [bsz, 1]
-    bs = seq_len_encoder.shape[0]
-    dim_emb = tmp_out.shape[1]
-    output_data = paddle.zeros((bs, dim_emb)).flatten()
-    seq_len = max_len
-    tmp_out = tmp_out.flatten()
-    for i in range(bs * dim_emb):
-        bi = i // dim_emb
-        bias_idx = i % dim_emb
-        seq_id = 0
-        # just encoder or stop, get last token; just decoder, get first token.
-        if seq_lens_decoder[bi] == 0:
-            if seq_len_encoder[bi] != 0:
-                seq_id = seq_len_encoder[bi] - 1
-            else:
-                continue
-        ori_token_idx = bi * seq_len - cum_offsets[bi] + seq_id
-        src_offset = ori_token_idx * dim_emb + bias_idx
-        output_data[i] = tmp_out[src_offset]
-    return output_data.reshape([bs, dim_emb])
+    max_enc_len = paddle.max(seq_lens_encoder, axis=0).item()
+    max_dec_len = paddle.max(seq_lens_decoder, axis=0).item()
+
+    max_batch = seq_lens_encoder.shape[0]
+    dim_emb = tmp_out.shape[2]
+    output_data = paddle.zeros((max_batch, dim_emb))
+
+    if max_enc_len > 0:  # context
+        j = 0
+        for i in range(max_batch):
+            if seq_lens_encoder[i].item() > 0:
+                seq_len = seq_lens_encoder[i].item()
+                output_data[i] = tmp_out[j, seq_len - 1]
+                j = j + 1
+    elif max_dec_len > 0:
+        batch_ids = paddle.where(seq_lens_decoder > 0)[0].flatten()
+        output_data = paddle.scatter(
+            output_data, batch_ids, tmp_out.squeeze(axis=1)[: batch_ids.shape[0], :]
+        )
+
+    return output_data
 
 
 def fused_flatpa_proj_ref(
