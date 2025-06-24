@@ -1,3 +1,5 @@
+// 2024 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights
+// Reserved.
 /* Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -278,7 +280,7 @@ void CrossEntropyWithSoftmaxGradKernel(const Context& dev_ctx,
 
 }  // namespace phi
 
-PD_CUSTOM_KERNEL_REGISTER(cross_entropy_with_softmax_grad,
+PD_REGISTER_PLUGIN_KERNEL(cross_entropy_with_softmax_grad,
                           metax_gpu,
                           ALL_LAYOUT,
                           phi::CrossEntropyWithSoftmaxGradKernel,

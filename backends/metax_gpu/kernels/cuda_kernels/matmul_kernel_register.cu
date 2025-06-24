@@ -1,3 +1,5 @@
+// 2024 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights
+// Reserved.
 /* Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +43,7 @@ PD_CUSTOM_KERNEL_REGISTER(matmul,
                           ALL_LAYOUT,
                           phi::MatmulKernel,
                           float,
+                          double,
                           int32_t,
                           int64_t,
                           phi::dtype::float16,
