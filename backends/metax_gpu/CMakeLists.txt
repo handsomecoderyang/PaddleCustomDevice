@@ -262,6 +262,7 @@ file(
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/mean_all_grad_kernel.cu
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/multiplex_kernel.cu
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/multiplex_grad_kernel.cu
+  ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/nonzero_kernel.cu
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/multiclass_nms3_kernel.cu
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/mp_allreduce_sum_kernel.cu
   ${PADDLE_SOURCE_DIR}/paddle/phi/kernels/gpu/pow2_decay_with_linear_warmup_kernel.cu
